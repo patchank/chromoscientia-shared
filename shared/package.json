@@ -16,8 +16,7 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "@chromoscientia/game-core": "file:../game-core",
-    "firebase": "^10.7.0"
+    "@chromoscientia/game-core": "file:../game-core"
   },
   "peerDependencies": {
     "firebase": "^10.0.0"

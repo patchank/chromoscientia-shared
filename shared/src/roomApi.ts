@@ -1,27 +1,7 @@
-import {
-  doc,
-  setDoc,
-  getDoc,
-  updateDoc,
-  deleteDoc,
-  onSnapshot,
-  serverTimestamp,
-  arrayUnion,
-  collection,
-  query,
-  where,
-  getDocs,
-  writeBatch,
-  limit,
-  Timestamp,
-  type Firestore,
-  type Unsubscribe,
-} from "firebase/firestore";
+import type { FirestoreAdapter } from "./firestoreAdapter";
 import {
   randomHex,
   rankGuessesAndAssignPoints,
-  getCurrentDescriberId,
-  isDescriber,
   allNonDescriberPlayersHaveGuessed,
   getNextTurnState,
   shuffle,
@@ -30,6 +10,7 @@ import {
   TOTAL_ROUNDS,
   type GameData,
   type Phase,
+  type RankedGuess,
 } from "@chromoscientia/game-core";
 import {
   DESCRIBER_BONUS_DISTANCE_CLOSE,
@@ -50,6 +31,8 @@ const MAX_OLD_ROOMS_TO_DELETE = 500;
 
 /** Error message thrown when joining with a nickname already in use. Compare to this in UI to show localized message. */
 export const NICKNAME_TAKEN_ERROR = "This nickname is already taken in this room";
+
+export type Unsubscribe = () => void;
 
 function generateRoomCode(): string {
   let code = "";
@@ -84,19 +67,19 @@ export interface GameSnapshot {
   updatedAt?: unknown;
 }
 
-async function deleteOldRoomsAndGames(db: Firestore): Promise<void> {
-  const cutoff = Timestamp.fromMillis(Date.now() - ROOM_MAX_AGE_MS);
-  const q = query(
-    collection(db, "rooms"),
-    where("createdAt", "<", cutoff),
-    limit(MAX_OLD_ROOMS_TO_DELETE)
+async function deleteOldRoomsAndGames(db: unknown, fs: FirestoreAdapter): Promise<void> {
+  const cutoff = fs.Timestamp.fromMillis(Date.now() - ROOM_MAX_AGE_MS);
+  const q = fs.query(
+    fs.collection(db, "rooms"),
+    fs.where("createdAt", "<", cutoff),
+    fs.limit(MAX_OLD_ROOMS_TO_DELETE)
   );
-  const snapshot = await getDocs(q);
+  const snapshot = await fs.getDocs(q);
   if (snapshot.empty) return;
-  const batch = writeBatch(db);
+  const batch = fs.writeBatch(db);
   for (const d of snapshot.docs) {
     batch.delete(d.ref);
-    batch.delete(doc(db, "games", d.id));
+    batch.delete(fs.doc(db, "games", d.id));
   }
   await batch.commit();
 }
@@ -120,29 +103,31 @@ export interface RoomApi {
 }
 
 export function createRoomApi(
-  getDb: () => Firestore | null,
-  getOrCreatePlayerId: () => string
+  getDb: () => unknown,
+  getOrCreatePlayerId: () => string,
+  firestore: FirestoreAdapter
 ): RoomApi {
+  const fs = firestore;
   const api: RoomApi = {
     async createRoom(nickname: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      await deleteOldRoomsAndGames(db);
+      await deleteOldRoomsAndGames(db, fs);
       const playerId = getOrCreatePlayerId();
       let code: string;
       let attempts = 0;
       do {
         code = generateRoomCode();
-        const ref = doc(db, "rooms", code);
-        const snap = await getDoc(ref);
+        const ref = fs.doc(db, "rooms", code);
+        const snap = await fs.getDoc(ref);
         if (!snap.exists()) {
-          await setDoc(ref, {
+          await fs.setDoc(ref, {
             code,
             hostId: playerId,
             playerIds: [playerId],
             playerNames: { [playerId]: nickname },
             status: "waiting",
-            createdAt: serverTimestamp(),
+            createdAt: fs.serverTimestamp(),
           });
           return code;
         }
@@ -154,13 +139,13 @@ export function createRoomApi(
     async joinRoom(code: string, nickname: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const roomRef = doc(db, "rooms", code.toUpperCase());
-      const snap = await getDoc(roomRef);
+      const roomRef = fs.doc(db, "rooms", code.toUpperCase());
+      const snap = await fs.getDoc(roomRef);
       if (!snap.exists()) throw new Error("Room not found");
       const data = snap.data();
       const status = data.status ?? "waiting";
       if (status !== "waiting") throw new Error("Game has already started");
-      const playerIds: string[] = data.playerIds ?? [];
+      const playerIds: string[] = (data.playerIds as string[]) ?? [];
       if (playerIds.length >= MAX_PLAYERS) throw new Error("Room is full");
       const playerId = getOrCreatePlayerId();
       if (playerIds.includes(playerId)) return;
@@ -169,8 +154,8 @@ export function createRoomApi(
       );
       const nameLower = nickname.trim().toLowerCase();
       if (existingNames.includes(nameLower)) throw new Error(NICKNAME_TAKEN_ERROR);
-      const playerNames = { ...(data.playerNames ?? {}), [playerId]: nickname };
-      await updateDoc(roomRef, {
+      const playerNames = { ...(data.playerNames as Record<string, string> ?? {}), [playerId]: nickname };
+      await fs.updateDoc(roomRef, {
         playerIds: [...playerIds, playerId],
         playerNames,
       });
@@ -179,18 +164,18 @@ export function createRoomApi(
     async leaveRoom(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const roomRef = doc(db, "rooms", roomCode);
-      const snap = await getDoc(roomRef);
+      const roomRef = fs.doc(db, "rooms", roomCode);
+      const snap = await fs.getDoc(roomRef);
       if (!snap.exists()) throw new Error("Room not found");
       const data = snap.data();
-      const playerIds: string[] = data.playerIds ?? [];
+      const playerIds: string[] = (data.playerIds as string[]) ?? [];
       const playerId = getOrCreatePlayerId();
       if (!playerIds.includes(playerId)) return;
       const newPlayerIds = playerIds.filter((id) => id !== playerId);
-      const playerNames = { ...(data.playerNames ?? {}) };
+      const playerNames = { ...(data.playerNames as Record<string, string> ?? {}) };
       delete playerNames[playerId];
       if (newPlayerIds.length === 0) {
-        await deleteDoc(roomRef);
+        await fs.deleteDoc(roomRef);
         return;
       }
       const updates: { playerIds: string[]; playerNames: Record<string, string>; hostId?: string } = {
@@ -198,33 +183,33 @@ export function createRoomApi(
         playerNames,
       };
       if (data.hostId === playerId) updates.hostId = newPlayerIds[0];
-      await updateDoc(roomRef, updates);
+      await fs.updateDoc(roomRef, updates);
     },
 
     async endGameForAll(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const roomRef = doc(db, "rooms", roomCode);
-      const snap = await getDoc(roomRef);
+      const roomRef = fs.doc(db, "rooms", roomCode);
+      const snap = await fs.getDoc(roomRef);
       if (!snap.exists()) return;
-      await updateDoc(roomRef, { status: "ended" as const, endedByLeave: true });
+      await fs.updateDoc(roomRef, { status: "ended" as const, endedByLeave: true });
     },
 
     async startGame(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const roomRef = doc(db, "rooms", roomCode);
-      const roomSnap = await getDoc(roomRef);
+      const roomRef = fs.doc(db, "rooms", roomCode);
+      const roomSnap = await fs.getDoc(roomRef);
       if (!roomSnap.exists()) throw new Error("Room not found");
       const room = roomSnap.data();
-      const playerIds: string[] = room.playerIds ?? [];
+      const playerIds: string[] = (room.playerIds as string[]) ?? [];
       if (playerIds.length < MIN_PLAYERS)
         throw new Error(`Need at least ${MIN_PLAYERS} players`);
       const playerOrder = shuffle(playerIds);
-      const gameRef = doc(db, "games", roomCode);
+      const gameRef = fs.doc(db, "games", roomCode);
       const initialScores: Record<string, number> = {};
       playerIds.forEach((id) => (initialScores[id] = 0));
-      await setDoc(gameRef, {
+      await fs.setDoc(gameRef, {
         roomCode,
         playerOrder,
         roundIndex: 0,
@@ -234,9 +219,9 @@ export function createRoomApi(
         description: "",
         guesses: {},
         scores: initialScores,
-        updatedAt: serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
       });
-      await updateDoc(roomRef, { status: "playing", endedByLeave: false });
+      await fs.updateDoc(roomRef, { status: "playing", endedByLeave: false });
     },
 
     async playAgain(roomCode: string) {
@@ -246,11 +231,11 @@ export function createRoomApi(
     async submitDescription(roomCode: string, description: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const gameRef = doc(db, "games", roomCode);
-      await updateDoc(gameRef, {
+      const gameRef = fs.doc(db, "games", roomCode);
+      await fs.updateDoc(gameRef, {
         description,
         phase: "guess" as Phase,
-        updatedAt: serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
       });
     },
 
@@ -258,21 +243,21 @@ export function createRoomApi(
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
       const playerId = getOrCreatePlayerId();
-      const gameRef = doc(db, "games", roomCode);
-      const snap = await getDoc(gameRef);
+      const gameRef = fs.doc(db, "games", roomCode);
+      const snap = await fs.getDoc(gameRef);
       if (!snap.exists()) throw new Error("Game not found");
-      const game = snap.data() as GameData;
+      const game = snap.data() as unknown as GameData;
       const guesses = { ...(game.guesses ?? {}), [playerId]: { color } };
-      await updateDoc(gameRef, { guesses, updatedAt: serverTimestamp() });
+      await fs.updateDoc(gameRef, { guesses, updatedAt: fs.serverTimestamp() });
     },
 
     async advanceToResults(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const gameRef = doc(db, "games", roomCode);
-      const snap = await getDoc(gameRef);
+      const gameRef = fs.doc(db, "games", roomCode);
+      const snap = await fs.getDoc(gameRef);
       if (!snap.exists()) throw new Error("Game not found");
-      const game = snap.data() as GameData;
+      const game = snap.data() as unknown as GameData;
       if (game.phase !== "guess") return;
       if (!allNonDescriberPlayersHaveGuessed(game)) return;
       const referenceHex = game.referenceColor;
@@ -288,12 +273,12 @@ export function createRoomApi(
       const describerId = game.playerOrder?.[game.turnIndex ?? 0] ?? "";
       const newGuesses: Record<string, { color: string; distance: number; points: number }> = {};
       const scores = { ...(game.scores ?? {}) };
-      ranked.forEach((r) => {
+      ranked.forEach((r: RankedGuess) => {
         newGuesses[r.playerId] = { color: r.color, distance: r.distance, points: r.points };
         scores[r.playerId] = (scores[r.playerId] ?? 0) + r.points;
       });
-      const hasVeryClose = ranked.some((r) => r.distance < DESCRIBER_BONUS_DISTANCE_VERY_CLOSE);
-      const hasClose = ranked.some((r) => r.distance < DESCRIBER_BONUS_DISTANCE_CLOSE);
+      const hasVeryClose = ranked.some((r: RankedGuess) => r.distance < DESCRIBER_BONUS_DISTANCE_VERY_CLOSE);
+      const hasClose = ranked.some((r: RankedGuess) => r.distance < DESCRIBER_BONUS_DISTANCE_CLOSE);
       const describerBonusForRound = hasVeryClose
         ? DESCRIBER_BONUS_POINTS_VERY_CLOSE
         : hasClose
@@ -302,23 +287,23 @@ export function createRoomApi(
       if (describerId && describerBonusForRound > 0) {
         scores[describerId] = (scores[describerId] ?? 0) + describerBonusForRound;
       }
-      await updateDoc(gameRef, {
+      await fs.updateDoc(gameRef, {
         guesses: newGuesses,
         scores,
         describerBonus: describerBonusForRound,
         phase: "results" as Phase,
-        updatedAt: serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
       });
     },
 
     async advanceToLeaderboard(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const gameRef = doc(db, "games", roomCode);
-      await updateDoc(gameRef, {
+      const gameRef = fs.doc(db, "games", roomCode);
+      await fs.updateDoc(gameRef, {
         phase: "leaderboard" as Phase,
         resultsAcknowledgedBy: [],
-        updatedAt: serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
       });
     },
 
@@ -326,12 +311,12 @@ export function createRoomApi(
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
       const playerId = getOrCreatePlayerId();
-      const gameRef = doc(db, "games", roomCode);
-      await updateDoc(gameRef, {
-        resultsAcknowledgedBy: arrayUnion(playerId),
-        updatedAt: serverTimestamp(),
+      const gameRef = fs.doc(db, "games", roomCode);
+      await fs.updateDoc(gameRef, {
+        resultsAcknowledgedBy: fs.arrayUnion(playerId),
+        updatedAt: fs.serverTimestamp(),
       });
-      const snap = await getDoc(gameRef);
+      const snap = await fs.getDoc(gameRef);
       if (!snap.exists()) return;
       const data = snap.data();
       const phase = data.phase as Phase;
@@ -346,17 +331,17 @@ export function createRoomApi(
     async advanceTurnOrEnd(roomCode: string) {
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
-      const gameRef = doc(db, "games", roomCode);
-      const roomRef = doc(db, "rooms", roomCode);
-      const snap = await getDoc(gameRef);
+      const gameRef = fs.doc(db, "games", roomCode);
+      const roomRef = fs.doc(db, "rooms", roomCode);
+      const snap = await fs.getDoc(gameRef);
       if (!snap.exists()) throw new Error("Game not found");
-      const game = snap.data() as GameData;
+      const game = snap.data() as unknown as GameData;
       const next = getNextTurnState(game);
       if (next.gameOver) {
-        await updateDoc(roomRef, { status: "ended" });
+        await fs.updateDoc(roomRef, { status: "ended" });
         return;
       }
-      await updateDoc(gameRef, {
+      await fs.updateDoc(gameRef, {
         roundIndex: next.roundIndex,
         turnIndex: next.turnIndex,
         phase: "describe" as Phase,
@@ -364,7 +349,7 @@ export function createRoomApi(
         description: "",
         guesses: {},
         leaderboardAcknowledgedBy: [],
-        updatedAt: serverTimestamp(),
+        updatedAt: fs.serverTimestamp(),
       });
     },
 
@@ -372,12 +357,12 @@ export function createRoomApi(
       const db = getDb();
       if (!db) throw new Error("Firebase not configured");
       const playerId = getOrCreatePlayerId();
-      const gameRef = doc(db, "games", roomCode);
-      await updateDoc(gameRef, {
-        leaderboardAcknowledgedBy: arrayUnion(playerId),
-        updatedAt: serverTimestamp(),
+      const gameRef = fs.doc(db, "games", roomCode);
+      await fs.updateDoc(gameRef, {
+        leaderboardAcknowledgedBy: fs.arrayUnion(playerId),
+        updatedAt: fs.serverTimestamp(),
       });
-      const snap = await getDoc(gameRef);
+      const snap = await fs.getDoc(gameRef);
       if (!snap.exists()) return;
       const data = snap.data();
       const phase = data.phase as Phase;
@@ -395,18 +380,18 @@ export function createRoomApi(
         onUpdate(null);
         return () => {};
       }
-      return onSnapshot(doc(db, "rooms", roomCode), (snap) => {
+      return fs.onSnapshot(fs.doc(db, "rooms", roomCode), (snap) => {
         if (!snap.exists()) {
           onUpdate(null);
           return;
         }
         const d = snap.data();
         onUpdate({
-          code: d.code ?? roomCode,
-          hostId: d.hostId ?? "",
-          playerIds: d.playerIds ?? [],
-          playerNames: d.playerNames ?? {},
-          status: d.status ?? "waiting",
+          code: (d.code as string) ?? roomCode,
+          hostId: (d.hostId as string) ?? "",
+          playerIds: (d.playerIds as string[]) ?? [],
+          playerNames: (d.playerNames as Record<string, string>) ?? {},
+          status: (d.status as "waiting" | "playing" | "ended") ?? "waiting",
           endedByLeave: d.endedByLeave === true,
         });
       });
@@ -418,25 +403,25 @@ export function createRoomApi(
         onUpdate(null);
         return () => {};
       }
-      return onSnapshot(doc(db, "games", roomCode), (snap) => {
+      return fs.onSnapshot(fs.doc(db, "games", roomCode), (snap) => {
         if (!snap.exists()) {
           onUpdate(null);
           return;
         }
         const d = snap.data();
         onUpdate({
-          roomCode: d.roomCode ?? roomCode,
-          playerOrder: d.playerOrder ?? [],
-          roundIndex: d.roundIndex ?? 0,
-          turnIndex: d.turnIndex ?? 0,
-          phase: d.phase ?? "describe",
-          referenceColor: d.referenceColor ?? "#000000",
-          description: d.description,
-          guesses: d.guesses ?? {},
-          scores: d.scores ?? {},
-          describerBonus: d.describerBonus,
-          resultsAcknowledgedBy: d.resultsAcknowledgedBy ?? [],
-          leaderboardAcknowledgedBy: d.leaderboardAcknowledgedBy ?? [],
+          roomCode: (d.roomCode as string) ?? roomCode,
+          playerOrder: (d.playerOrder as string[]) ?? [],
+          roundIndex: (d.roundIndex as number) ?? 0,
+          turnIndex: (d.turnIndex as number) ?? 0,
+          phase: (d.phase as Phase) ?? "describe",
+          referenceColor: (d.referenceColor as string) ?? "#000000",
+          description: d.description as string | undefined,
+          guesses: (d.guesses as GameSnapshot["guesses"]) ?? {},
+          scores: (d.scores as Record<string, number>) ?? {},
+          describerBonus: d.describerBonus as number | undefined,
+          resultsAcknowledgedBy: (d.resultsAcknowledgedBy as string[]) ?? [],
+          leaderboardAcknowledgedBy: (d.leaderboardAcknowledgedBy as string[]) ?? [],
           updatedAt: d.updatedAt,
         });
       });
